@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""Portable cc/cx tmux slot launcher."""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+
+SLOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+DEFAULT_ARGS = {
+    "cc": ["--model", "claude-opus-5"],
+    "cx": ["--model", "gpt-5.6-sol"],
+}
+
+
+class SlotError(RuntimeError):
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def fail(message: str, code: int = 2) -> None:
+    print(f"cc-slot: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def config_path() -> Path:
+    explicit = os.environ.get("DUAL_BRAIN_CONFIG")
+    if explicit:
+        return Path(explicit).expanduser()
+    plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA")
+    if plugin_data:
+        return Path(plugin_data).expanduser() / "config.json"
+    raise SlotError("DUAL_BRAIN_CONFIG 또는 CLAUDE_PLUGIN_DATA가 필요합니다")
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as error:
+        raise SlotError(f"config를 읽을 수 없습니다: {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise SlotError(f"config object가 아닙니다: {path}")
+    return value
+
+
+def string_list(value: Any, field: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+        raise SlotError(f"config {field}는 비어 있지 않은 문자열 배열이어야 합니다")
+    return list(value)
+
+
+def configured_slots(config: dict[str, Any]) -> dict[str, str]:
+    cc_slots = string_list(config.get("ccSlots"), "ccSlots")
+    cx_slots = string_list(config.get("cxSlots"), "cxSlots")
+    slots = config.get("slots")
+    if slots is not None:
+        if not isinstance(slots, dict):
+            raise SlotError("config slots는 object여야 합니다")
+        if "cc" in slots or "cx" in slots:
+            cc_slots = string_list(slots.get("cc"), "slots.cc")
+            cx_slots = string_list(slots.get("cx"), "slots.cx")
+        else:
+            for name, kind in slots.items():
+                if kind in {"cc", "native"}:
+                    cc_slots.append(name)
+                elif kind in {"cx", "proxy"}:
+                    cx_slots.append(name)
+                else:
+                    raise SlotError(f"config slots.{name} 종류가 올바르지 않습니다: {kind}")
+    if not cc_slots and not cx_slots:
+        raise SlotError("config에 cc/cx managed slot이 없습니다")
+
+    result: dict[str, str] = {}
+    for kind, names in (("cc", cc_slots), ("cx", cx_slots)):
+        for name in names:
+            if not SLOT_RE.fullmatch(name):
+                raise SlotError(f"안전하지 않은 slot 이름입니다: {name}")
+            if name in result:
+                raise SlotError(f"slot이 중복 정의됐습니다: {name}")
+            result[name] = kind
+    return result
+
+
+def configured_args(config: dict[str, Any], slot: str, kind: str) -> list[str]:
+    slot_args = config.get("slotArgs")
+    value: Any = None
+    field = ""
+    if slot_args is not None:
+        if not isinstance(slot_args, dict):
+            raise SlotError("config slotArgs는 object여야 합니다")
+        if slot in slot_args:
+            value = slot_args[slot]
+            field = f"slotArgs.{slot}"
+    if value is None:
+        for candidate in (("ccArgs", "nativeArgs") if kind == "cc" else ("cxArgs", "proxyArgs")):
+            if candidate in config:
+                value = config[candidate]
+                field = candidate
+                break
+    args = string_list(value, field) if value is not None else list(DEFAULT_ARGS[kind])
+    if not args:
+        args = list(DEFAULT_ARGS[kind])
+    for index, arg in enumerate(args):
+        if arg in {"--resume", "--session-id"} or arg.startswith(("--resume=", "--session-id=")):
+            raise SlotError(f"config {field or 'args'}가 SID binding 옵션을 포함합니다: {arg}")
+        if index and args[index - 1] in {"--resume", "--session-id"}:
+            raise SlotError(f"config {field or 'args'}가 SID binding 값을 포함합니다")
+    return args
+
+
+def resolve_executable(configured: Any, fallback: str, field: str) -> str:
+    if configured is not None and not isinstance(configured, str):
+        raise SlotError(f"config {field} 값이 문자열이 아닙니다")
+    candidate = configured or shutil.which(fallback)
+    if not candidate:
+        raise SlotError(f"실행 파일을 찾을 수 없습니다: {fallback}")
+    try:
+        resolved = Path(candidate).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise SlotError(f"실행 파일을 해석할 수 없습니다: {candidate}: {error}") from error
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise SlotError(f"실행 파일이 아닙니다: {resolved}")
+    return str(resolved)
+
+
+def plugin_data_root(path: Path) -> Path:
+    value = os.environ.get("CLAUDE_PLUGIN_DATA")
+    return Path(value).expanduser() if value else path.parent
+
+
+def ensure_private_dir(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink() or not path.is_dir():
+        raise SlotError(f"안전하지 않은 state directory입니다: {path}")
+    os.chmod(path, 0o700)
+
+
+def atomic_json_write(path: Path, payload: dict[str, str]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def read_slot_map(path: Path) -> dict[str, str]:
+    if path.is_symlink():
+        raise SlotError(f"slot-map이 symlink입니다: {path}")
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise SlotError(f"slot-map을 읽을 수 없습니다: {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise SlotError("slot-map object가 아닙니다")
+    result: dict[str, str] = {}
+    for slot, sid in value.items():
+        if not isinstance(slot, str) or not isinstance(sid, str):
+            raise SlotError("slot-map entry가 문자열이 아닙니다")
+        try:
+            parsed = uuid.UUID(sid)
+        except ValueError as error:
+            raise SlotError(f"slot-map SID 형식이 올바르지 않습니다: {slot}={sid}") from error
+        if str(parsed) != sid:
+            raise SlotError(f"slot-map SID가 canonical UUID가 아닙니다: {slot}={sid}")
+        result[slot] = sid
+    os.chmod(path, 0o600)
+    return result
+
+
+def tmux_has_session(tmux: str, slot: str) -> bool:
+    result = subprocess.run(
+        [tmux, "has-session", "-t", f"={slot}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def transcript_exists(directory: Path, sid: str) -> bool:
+    return (directory / f"{sid}.jsonl").is_file()
+
+
+def usage() -> None:
+    print("사용법: cc-slot <slot> [--fresh|fresh|new]", file=sys.stderr)
+
+
+def parse_args(argv: list[str]) -> tuple[str, bool]:
+    if not argv:
+        usage()
+        raise SystemExit(2)
+    slot = argv[0]
+    rest = argv[1:]
+    if not rest:
+        return slot, False
+    if len(rest) == 1 and rest[0] in {"--fresh", "fresh", "new"}:
+        return slot, True
+    usage()
+    raise SlotError(f"알 수 없는 옵션입니다: {' '.join(rest)}")
+
+
+def main() -> None:
+    if not sys.platform.startswith("linux") or not Path("/proc/self/stat").is_file():
+        raise SlotError("Linux 또는 WSL2 /proc 환경만 지원합니다")
+    slot, fresh = parse_args(sys.argv[1:])
+    path = config_path().resolve()
+    config = load_config(path)
+    slots = configured_slots(config)
+    kind = slots.get(slot)
+    if kind is None:
+        raise SlotError(f"managed cc/cx slot이 아닙니다: {slot}")
+
+    tmux = resolve_executable(config.get("tmuxBinary"), "tmux", "tmuxBinary")
+    transcript_value = config.get("transcriptDir", config.get("transcriptRoot"))
+    if not isinstance(transcript_value, str) or not transcript_value:
+        raise SlotError("config transcriptDir가 필요합니다")
+    transcript_dir = Path(transcript_value).expanduser().resolve()
+    if not transcript_dir.is_dir():
+        raise SlotError(f"transcript directory가 없습니다: {transcript_dir}")
+    launcher = Path(__file__).resolve().with_name("claude-brain")
+    if not launcher.is_file() or not os.access(launcher, os.X_OK):
+        raise SlotError(f"dual-brain launcher가 없습니다: {launcher}")
+    env_binary = resolve_executable(None, "env", "envBinary")
+    downstream = configured_args(config, slot, kind)
+
+    state_dir = plugin_data_root(path) / "state"
+    ensure_private_dir(state_dir)
+    slot_map_path = state_dir / "slot-map.json"
+    lock_path = state_dir / "slot-map.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    os.chmod(lock_path, 0o600)
+
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if tmux_has_session(tmux, slot):
+            if fresh:
+                raise SlotError(
+                    f"[{slot}] 이미 실행 중입니다. 기존 세션을 종료한 뒤 fresh를 다시 요청하세요",
+                    75,
+                )
+            os.close(lock_fd)
+            os.execv(tmux, [tmux, "attach-session", "-t", f"={slot}"])
+
+        mapping = read_slot_map(slot_map_path)
+        sid = mapping.get(slot)
+        reason = "직전 기록 없음"
+        if fresh:
+            if slot in mapping:
+                del mapping[slot]
+                atomic_json_write(slot_map_path, mapping)
+            sid = None
+            reason = "명시적 fresh"
+        elif sid and not transcript_exists(transcript_dir, sid):
+            print(f"[{slot}] 직전 세션 기록 없음(stale): {sid} → 새 세션", flush=True)
+            del mapping[slot]
+            atomic_json_write(slot_map_path, mapping)
+            sid = None
+            reason = "stale 기록 제거"
+
+        if sid:
+            for other_slot, other_sid in mapping.items():
+                if other_slot != slot and other_sid == sid and tmux_has_session(tmux, other_slot):
+                    raise SlotError(
+                        f"[{slot}] resume 차단: SID {sid}를 live slot [{other_slot}]이 사용 중입니다",
+                        76,
+                    )
+
+        command = [
+            env_binary,
+            f"CC_SLOT_OVERRIDE={slot}",
+            f"DUAL_BRAIN_CONFIG={path}",
+            f"CLAUDE_BRAIN_CONFIG={path}",
+        ]
+        plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA")
+        if plugin_data:
+            command.append(f"CLAUDE_PLUGIN_DATA={Path(plugin_data).expanduser()}")
+        command.extend(
+            [
+                str(launcher),
+                "supervise",
+                "--initial-backend",
+                "native" if kind == "cc" else "proxy",
+                "--slot",
+                slot,
+                "--transcript-dir",
+                str(transcript_dir),
+                "--slot-map",
+                str(slot_map_path),
+                "--",
+            ]
+        )
+        if sid:
+            command.extend(["--resume", sid])
+            print(f"[{slot}] 직전 세션 resume: {sid}", flush=True)
+        else:
+            print(f"[{slot}] 새 세션 ({reason})", flush=True)
+        command.extend(downstream)
+
+        result = subprocess.run(
+            [tmux, "new-session", "-d", "-s", slot, shlex.join(command)],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise SlotError(f"tmux session 시작에 실패했습니다: {slot}", 1)
+    finally:
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+    os.execv(tmux, [tmux, "attach-session", "-t", f"={slot}"])
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SlotError as error:
+        fail(str(error), error.code)

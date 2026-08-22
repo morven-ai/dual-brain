@@ -1,0 +1,18 @@
+{
+  "name": "dual-brain",
+  "owner": {
+    "name": "morven-ai",
+    "url": "https://github.com/morven-ai"
+  },
+  "metadata": {
+    "description": "Same-SID Claude Code dual-brain runtime for Linux and WSL2.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "dual-brain",
+      "source": "./",
+      "description": "Switch a Claude Code root session between Anthropic and OpenAI-backed models without losing the session ID, transcript, or working directory. Includes an independent cross-provider review gate and a transactional installer."
+    }
+  ]
+}

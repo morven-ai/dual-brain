@@ -1,0 +1,16 @@
+{
+  "name": "dual-brain",
+  "version": "0.1.0",
+  "description": "Portable Linux/WSL2 same-SID Claude Code dual-brain runtime.",
+  "keywords": [
+    "claude-code",
+    "linux",
+    "wsl2",
+    "session",
+    "code-review"
+  ],
+  "author": {
+    "name": "morven-ai"
+  },
+  "homepage": "https://github.com/morven-ai/dual-brain"
+}

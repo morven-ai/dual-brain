@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Read-only provenance gate for the optional Paseo integration."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+ASSETS = ROOT / "assets" / "paseo"
+PROVENANCE = ASSETS / "provenance.json"
+
+
+class PaseoError(RuntimeError):
+    pass
+
+
+def run_git(checkout: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(checkout), *arguments],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def git_value(checkout: Path, *arguments: str) -> str:
+    result = run_git(checkout, *arguments)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_provenance() -> dict[str, Any]:
+    try:
+        value = json.loads(PROVENANCE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise PaseoError(f"provenance를 읽을 수 없습니다: {error}") from error
+    if not isinstance(value, dict):
+        raise PaseoError("provenance object가 아닙니다")
+    return value
+
+
+def inspect(checkout: Path) -> dict[str, Any]:
+    provenance = load_provenance()
+    if not checkout.is_dir():
+        raise PaseoError(f"checkout directory가 없습니다: {checkout}")
+    checks: dict[str, bool] = {
+        "gitRepository": bool(git_value(checkout, "rev-parse", "--git-dir")),
+        "clean": run_git(checkout, "status", "--porcelain").stdout.strip() == "",
+        "origin": git_value(checkout, "remote", "get-url", "origin") == provenance["upstream"],
+        "head": git_value(checkout, "rev-parse", "HEAD") == provenance["peeledCommit"],
+        "tagObject": git_value(checkout, "rev-parse", provenance["tag"]) == provenance["tagObject"],
+        "peeledTag": git_value(checkout, "rev-parse", f"{provenance['tag']}^{{}}") == provenance["peeledCommit"],
+        "noSubmodules": not (checkout / ".gitmodules").exists(),
+        "packageVersion": False,
+        "packageLock": False,
+    }
+    try:
+        package = json.loads((checkout / "package.json").read_text(encoding="utf-8"))
+        checks["packageVersion"] = package.get("version") == provenance["version"]
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    try:
+        checks["packageLock"] = sha256(checkout / "package-lock.json") == provenance["packageLockSha256"]
+    except OSError:
+        pass
+
+    exact_source = all(checks.values())
+    return {
+        "supported": False,
+        "exactSource": exact_source,
+        "maintenanceLeaseAvailable": False,
+        "mutationAllowed": False,
+        "reason": "Paseo v0.4.0에는 신규 agent/terminal 생성을 차단하는 획득형 maintenance lease가 없습니다",
+        "checks": checks,
+        "provenance": {
+            "version": provenance["version"],
+            "tag": provenance["tag"],
+            "peeledCommit": provenance["peeledCommit"],
+            "patchSha256": provenance["patchSha256"],
+            "patchBundled": provenance.get("patchBundled", False),
+        },
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="paseo-adapter")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+    preflight = subcommands.add_parser("preflight")
+    preflight.add_argument("--checkout", required=True)
+    apply = subcommands.add_parser("apply")
+    apply.add_argument("--checkout", required=True)
+    args = parser.parse_args()
+    result = inspect(Path(args.checkout).expanduser().resolve())
+    print(json.dumps(result, ensure_ascii=False))
+    if args.command == "apply":
+        print("paseo-adapter: maintenance lease 부재로 mutation을 차단했습니다", file=sys.stderr)
+        return 2
+    return 0 if result["supported"] else 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (PaseoError, KeyError, subprocess.TimeoutExpired) as error:
+        print(f"paseo-adapter: {error}", file=sys.stderr)
+        raise SystemExit(2)

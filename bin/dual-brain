@@ -1,0 +1,754 @@
+#!/usr/bin/env python3
+"""Transactional installer and verifier for Claude Code Dual-Brain."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import platform
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+VERSION = "0.1.0"
+PLAN_VERSION = 1
+OWNER = "dual-brain-v1"
+SHIM_MARKER = "# dual-brain-managed-v1"
+REQUIRED_BINARIES = ("python3", "node", "bash", "tmux", "jq", "flock", "realpath", "claude", "claudex")
+OPTIONAL_BINARIES = ("codex-cc",)
+EXCLUDED_PARTS = {"__pycache__", ".git"}
+
+
+class InstallerError(RuntimeError):
+    pass
+
+
+def plugin_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def plugin_data() -> Path:
+    value = os.environ.get("CLAUDE_PLUGIN_DATA")
+    if not value:
+        raise InstallerError("CLAUDE_PLUGIN_DATA가 필요합니다")
+    return Path(value).expanduser().resolve()
+
+
+def user_home() -> Path:
+    value = os.environ.get("DUAL_BRAIN_USER_HOME")
+    return Path(value).expanduser().resolve() if value else Path.home().resolve()
+
+
+def ensure_private_directory(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+        raise InstallerError(f"안전하지 않은 directory입니다: {path}")
+    path.chmod(0o700)
+
+
+@contextmanager
+def mutation_lock(data: Path) -> Iterator[None]:
+    ensure_private_directory(data)
+    lock_path = data / "installer.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    os.chmod(lock_path, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise InstallerError("다른 dual-brain transaction이 실행 중입니다") from error
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def atomic_bytes(
+    path: Path,
+    content: bytes,
+    mode: int = 0o600,
+    *,
+    private_parent: bool = True,
+) -> None:
+    if private_parent:
+        ensure_private_directory(path.parent)
+    else:
+        path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        info = path.parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+            raise InstallerError(f"안전하지 않은 parent directory입니다: {path.parent}")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, mode)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    atomic_bytes(
+        path,
+        (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode(),
+    )
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise InstallerError(f"JSON을 읽을 수 없습니다: {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise InstallerError(f"JSON object가 아닙니다: {path}")
+    return value
+
+
+def sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def package_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if any(part in EXCLUDED_PARTS for part in relative.parts) or path.suffix == ".pyc":
+            continue
+        if path.is_symlink():
+            raise InstallerError(f"plugin bundle에 symlink를 허용하지 않습니다: {relative}")
+        if path.is_file():
+            files.append(path)
+    return sorted(files, key=lambda value: value.relative_to(root).as_posix())
+
+
+def tree_hash(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in package_files(root):
+        relative = path.relative_to(root).as_posix().encode()
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        content_hash = bytes.fromhex(sha256_file(path))
+        digest.update(content_hash)
+        digest.update((1 if path.stat().st_mode & 0o111 else 0).to_bytes(1, "big"))
+    return digest.hexdigest()
+
+
+def resolve_binary(name: str) -> dict[str, Any]:
+    candidate = shutil.which(name)
+    if not candidate:
+        return {"name": name, "available": False}
+    try:
+        path = Path(candidate).resolve(strict=True)
+        info = path.stat()
+        available = path.is_file() and os.access(path, os.X_OK)
+    except OSError:
+        return {"name": name, "available": False}
+    version = ""
+    if available:
+        try:
+            result = subprocess.run(
+                [str(path), "--version"],
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            version = (result.stdout or result.stderr).splitlines()[0][:200] if (result.stdout or result.stderr) else ""
+        except (OSError, subprocess.TimeoutExpired):
+            version = ""
+    return {
+        "name": name,
+        "available": available,
+        "path": str(path),
+        "ownerUid": info.st_uid,
+        "mode": f"{stat.S_IMODE(info.st_mode):04o}",
+        "version": version,
+    }
+
+
+def preflight_payload() -> dict[str, Any]:
+    linux = sys.platform.startswith("linux")
+    proc = Path("/proc/self/stat").is_file()
+    release = platform.release().lower()
+    wsl = "microsoft" in release or "wsl" in release
+    binaries = [resolve_binary(name) for name in (*REQUIRED_BINARIES, *OPTIONAL_BINARIES)]
+    required_ok = all(item["available"] for item in binaries if item["name"] in REQUIRED_BINARIES)
+    return {
+        "supported": linux and proc and required_ok,
+        "platform": "wsl2" if wsl else "linux" if linux else sys.platform,
+        "architecture": platform.machine(),
+        "proc": proc,
+        "systemdRequiredForCore": False,
+        "binaries": binaries,
+    }
+
+
+def binary_map(preflight: dict[str, Any]) -> dict[str, str]:
+    return {
+        item["name"]: item["path"]
+        for item in preflight["binaries"]
+        if item.get("available") and isinstance(item.get("path"), str)
+    }
+
+
+def transcript_directory(cwd: Path) -> Path:
+    explicit = os.environ.get("DUAL_BRAIN_TRANSCRIPT_DIR")
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+    else:
+        key = str(cwd.resolve()).replace("/", "-")
+        path = user_home() / ".claude" / "projects" / key
+    if not path.is_dir():
+        raise InstallerError(
+            "transcript directory를 찾을 수 없습니다. DUAL_BRAIN_TRANSCRIPT_DIR로 명시하세요"
+        )
+    return path
+
+
+def file_fingerprint(path: Path) -> dict[str, Any]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {"type": "missing"}
+    result: dict[str, Any] = {
+        "ownerUid": info.st_uid,
+        "mode": f"{stat.S_IMODE(info.st_mode):04o}",
+    }
+    if stat.S_ISREG(info.st_mode):
+        result.update({"type": "file", "sha256": sha256_file(path)})
+    elif stat.S_ISLNK(info.st_mode):
+        result.update({"type": "symlink", "target": os.readlink(path)})
+    elif stat.S_ISDIR(info.st_mode):
+        result["type"] = "directory"
+    else:
+        result["type"] = "other"
+    return result
+
+
+def managed_shim(path: Path, expected: bytes | None = None) -> bool:
+    try:
+        content = path.read_bytes()
+        lines = content.decode().splitlines()
+        return path.is_file() and lines[1] == SHIM_MARKER and (expected is None or content == expected)
+    except (OSError, UnicodeDecodeError, IndexError):
+        return False
+
+
+def config_is_managed(path: Path) -> bool:
+    try:
+        return read_json(path).get("managedBy") == OWNER
+    except InstallerError:
+        return False
+
+
+def active_transaction_is_managed(path: Path) -> bool:
+    try:
+        value = read_json(path)
+        return value.get("managedBy") == OWNER and str(uuid.UUID(value["transactionId"])) == value["transactionId"]
+    except (InstallerError, KeyError, TypeError, ValueError):
+        return False
+
+
+def target_paths(data: Path) -> dict[str, Path]:
+    bin_dir = user_home() / ".local" / "bin"
+    return {
+        "config": data / "config.json",
+        "active": data / "active-transaction.json",
+        "current": data / "current",
+        "dual-brain": bin_dir / "dual-brain",
+        "brain": bin_dir / "brain",
+        "cc-slot": bin_dir / "cc-slot",
+    }
+
+
+def detect_conflicts(paths: dict[str, Path], data: Path) -> list[str]:
+    conflicts: list[str] = []
+    for name in ("dual-brain", "brain", "cc-slot"):
+        path = paths[name]
+        if path.exists() or path.is_symlink():
+            if path.is_symlink() or not managed_shim(path, shim_content(data, name)):
+                conflicts.append(f"unknown shim: {path}")
+    config = paths["config"]
+    if (config.exists() or config.is_symlink()) and (config.is_symlink() or not config_is_managed(config)):
+        conflicts.append(f"unknown config: {config}")
+    active = paths["active"]
+    if (active.exists() or active.is_symlink()) and (active.is_symlink() or not active_transaction_is_managed(active)):
+        conflicts.append(f"unknown active transaction: {active}")
+    current = paths["current"]
+    if current.exists() or current.is_symlink():
+        if not current.is_symlink():
+            conflicts.append(f"current가 symlink가 아님: {current}")
+        else:
+            try:
+                target = current.resolve(strict=True)
+                runtimes = (data / "runtimes").resolve()
+                if target.parent != runtimes:
+                    conflicts.append(f"unknown current target: {current}")
+            except OSError:
+                conflicts.append(f"broken current target: {current}")
+    return conflicts
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    data = plugin_data()
+    ensure_private_directory(data)
+    preflight = preflight_payload()
+    if not preflight["supported"]:
+        raise InstallerError("preflight가 지원 환경을 확인하지 못했습니다")
+    if args.paseo:
+        adapter = plugin_root() / "libexec" / "paseo-adapter"
+        result = subprocess.run(
+            [str(adapter), "preflight", "--checkout", args.paseo],
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        try:
+            paseo = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise InstallerError("Paseo preflight 결과가 올바르지 않습니다") from error
+        if result.returncode != 0 or paseo.get("supported") is not True:
+            raise InstallerError(f"Paseo integration 차단: {paseo.get('reason', 'preflight 실패')}")
+        raise InstallerError("Paseo integration apply contract가 이 버전에서 활성화되지 않았습니다")
+    root = plugin_root()
+    bundle_hash = tree_hash(root)
+    paths = target_paths(data)
+    conflicts = detect_conflicts(paths, data)
+    if conflicts:
+        raise InstallerError("; ".join(conflicts))
+    cwd = Path.cwd().resolve()
+    transcript = transcript_directory(cwd)
+    binaries = binary_map(preflight)
+    if args.review_gate and "codex-cc" not in binaries:
+        raise InstallerError("--review-gate에는 codex-cc가 필요합니다")
+    proxy_endpoint = os.environ.get("DUAL_BRAIN_PROXY_BASE_URL", "")
+    planned_config = {
+        "managedBy": OWNER,
+        "schemaVersion": 1,
+        "nativeBinary": binaries["claude"],
+        "proxyBinary": binaries["claudex"],
+        "codexBinary": binaries.get("codex-cc", ""),
+        "tmuxBinary": binaries["tmux"],
+        "transcriptDir": str(transcript),
+        "slots": {
+            "cc": [f"cc{index}" for index in range(1, 6)],
+            "cx": [f"cx{index}" for index in range(1, 6)],
+        },
+        "ccArgs": ["--model", "claude-opus-5"],
+        "cxArgs": ["--model", "gpt-5.6-sol"],
+        "reviewGateEnabled": bool(args.review_gate),
+        **({"proxyBaseUrl": proxy_endpoint} if proxy_endpoint else {}),
+    }
+    if paths["config"].exists() and read_json(paths["config"]) != planned_config:
+        raise InstallerError(
+            "기존 user-owned config와 요청 plan이 다릅니다. v1은 기존 config를 자동 수정하지 않습니다"
+        )
+    plan_id = str(uuid.uuid4())
+    plan = {
+        "version": PLAN_VERSION,
+        "id": plan_id,
+        "createdAtNs": time.time_ns(),
+        "sourceRoot": str(root),
+        "sourceBundleSha256": bundle_hash,
+        "pluginVersion": VERSION,
+        "pluginData": str(data),
+        "userHome": str(user_home()),
+        "projectRoot": str(cwd),
+        "reviewGate": bool(args.review_gate),
+        "paseo": None,
+        "config": planned_config,
+        "fingerprints": {name: file_fingerprint(path) for name, path in paths.items()},
+        "actions": [
+            {"action": "install-runtime", "path": str(data / "runtimes" / f"{VERSION}-{bundle_hash[:12]}")},
+            {"action": "create-if-missing", "path": str(paths["config"])},
+            *[
+                {"action": "install-managed-shim", "path": str(paths[name])}
+                for name in ("dual-brain", "brain", "cc-slot")
+            ],
+            {"action": "record-active-transaction", "path": str(paths["active"])},
+            {"action": "atomic-current-switch", "path": str(paths["current"])},
+        ],
+    }
+    plan_path = data / "plans" / f"{plan_id}.json"
+    atomic_json(plan_path, plan)
+    print(json.dumps({"planId": plan_id, "planPath": str(plan_path), **plan}, ensure_ascii=False))
+    return 0
+
+
+def verify_fingerprints(plan: dict[str, Any], paths: dict[str, Path]) -> None:
+    expected = plan.get("fingerprints")
+    if not isinstance(expected, dict):
+        raise InstallerError("plan fingerprints가 없습니다")
+    for name, path in paths.items():
+        if file_fingerprint(path) != expected.get(name):
+            raise InstallerError(f"plan 이후 target이 변경됐습니다: {path}")
+
+
+def copy_runtime(source: Path, staging: Path) -> None:
+    staging.mkdir(mode=0o700, parents=False)
+    for source_file in package_files(source):
+        relative = source_file.relative_to(source)
+        target = staging / relative
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        shutil.copy2(source_file, target, follow_symlinks=False)
+    if tree_hash(staging) != tree_hash(source):
+        raise InstallerError("staging runtime hash가 source와 다릅니다")
+
+
+def seal_runtime(runtime: Path) -> None:
+    for path in sorted(runtime.rglob("*"), reverse=True):
+        if path.is_file():
+            executable = bool(path.stat().st_mode & 0o111)
+            path.chmod(0o555 if executable else 0o444)
+        elif path.is_dir():
+            path.chmod(0o555)
+    runtime.chmod(0o555)
+
+
+def shim_content(data: Path, target: str) -> bytes:
+    relative = {
+        "dual-brain": "bin/dual-brain",
+        "brain": "bin/brain",
+        "cc-slot": "libexec/cc-slot",
+    }[target]
+    return (
+        "#!/usr/bin/env bash\n"
+        f"{SHIM_MARKER}\n"
+        "set -euo pipefail\n"
+        f"export CLAUDE_PLUGIN_DATA={json.dumps(str(data))}\n"
+        f"export DUAL_BRAIN_CONFIG={json.dumps(str(data / 'config.json'))}\n"
+        f"exec {json.dumps(str(data / 'current' / relative))} \"$@\"\n"
+    ).encode()
+
+
+def atomic_symlink(path: Path, target: Path) -> None:
+    ensure_private_directory(path.parent)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    os.symlink(str(target), temporary)
+    try:
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def backup_targets(transaction: Path, paths: dict[str, Path]) -> dict[str, Any]:
+    before: dict[str, Any] = {}
+    backup = transaction / "backup"
+    ensure_private_directory(backup)
+    for name, path in paths.items():
+        fingerprint = file_fingerprint(path)
+        before[name] = {"path": str(path), "fingerprint": fingerprint}
+        if fingerprint["type"] == "file":
+            target = backup / name
+            shutil.copy2(path, target)
+            target.chmod(0o600)
+            before[name]["backup"] = str(target)
+        elif fingerprint["type"] == "symlink":
+            before[name]["target"] = os.readlink(path)
+    return before
+
+
+def restore_before(transaction: Path) -> None:
+    manifest = read_json(transaction / "manifest.json")
+    before = manifest.get("before")
+    if not isinstance(before, dict):
+        raise InstallerError("transaction before manifest가 없습니다")
+    applied_path = transaction / "applied.json"
+    if applied_path.exists():
+        applied = read_json(applied_path)
+        after = applied.get("after")
+        if not isinstance(after, dict):
+            raise InstallerError("transaction applied fingerprint가 없습니다")
+        for name, item in before.items():
+            if file_fingerprint(Path(item["path"])) != after.get(name):
+                raise InstallerError(f"transaction 이후 target이 변경되어 rollback을 거부합니다: {item['path']}")
+    for name in ("config", "dual-brain", "brain", "cc-slot", "active", "current"):
+        item = before[name]
+        path = Path(item["path"])
+        kind = item["fingerprint"]["type"]
+        if kind == "missing":
+            if path.is_dir() and not path.is_symlink():
+                raise InstallerError(f"rollback target이 directory로 바뀌었습니다: {path}")
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        elif kind == "file":
+            atomic_bytes(
+                path,
+                Path(item["backup"]).read_bytes(),
+                int(item["fingerprint"]["mode"], 8),
+                private_parent=name in {"config", "active"},
+            )
+        elif kind == "symlink":
+            atomic_symlink(path, Path(item["target"]))
+        else:
+            raise InstallerError(f"rollback 불가 target type: {path}")
+    for item in before.values():
+        path = Path(item["path"])
+        if file_fingerprint(path) != item["fingerprint"]:
+            raise InstallerError(f"rollback 이전 상태 검증 실패: {path}")
+    atomic_json(transaction / "rollback.json", {"status": "rolled-back", "verified": True, "atNs": time.time_ns()})
+
+
+def load_plan(plan_id: str) -> tuple[Path, dict[str, Any]]:
+    try:
+        uuid.UUID(plan_id)
+    except ValueError as error:
+        raise InstallerError("plan ID가 UUID가 아닙니다") from error
+    path = plugin_data() / "plans" / f"{plan_id}.json"
+    plan = read_json(path)
+    if plan.get("id") != plan_id or plan.get("version") != PLAN_VERSION:
+        raise InstallerError("plan identity가 올바르지 않습니다")
+    return path, plan
+
+
+def _command_apply_unlocked(args: argparse.Namespace) -> int:
+    _, plan = load_plan(args.plan)
+    data = plugin_data()
+    if Path(plan["pluginData"]).resolve() != data or Path(plan["userHome"]).resolve() != user_home():
+        raise InstallerError("plan host identity가 현재 환경과 다릅니다")
+    source = Path(plan["sourceRoot"]).resolve(strict=True)
+    if tree_hash(source) != plan["sourceBundleSha256"]:
+        raise InstallerError("plan 이후 plugin source가 변경됐습니다")
+    paths = target_paths(data)
+    verify_fingerprints(plan, paths)
+
+    transaction_id = str(uuid.uuid4())
+    transaction = data / "transactions" / transaction_id
+    ensure_private_directory(transaction)
+    before = backup_targets(transaction, paths)
+    atomic_json(
+        transaction / "manifest.json",
+        {"version": 1, "id": transaction_id, "planId": plan["id"], "before": before},
+    )
+
+    runtime = data / "runtimes" / f"{VERSION}-{plan['sourceBundleSha256'][:12]}"
+    ensure_private_directory(runtime.parent)
+    try:
+        if runtime.exists():
+            if not runtime.is_dir() or tree_hash(runtime) != plan["sourceBundleSha256"]:
+                raise InstallerError(f"기존 runtime hash가 다릅니다: {runtime}")
+        else:
+            staging = runtime.with_name(f".{runtime.name}.{transaction_id}.staging")
+            copy_runtime(source, staging)
+            staging.rename(runtime)
+            seal_runtime(runtime)
+
+        if paths["config"].exists():
+            if not config_is_managed(paths["config"]):
+                raise InstallerError("config ownership가 바뀌었습니다")
+        else:
+            atomic_json(paths["config"], plan["config"])
+
+        ensure_private_directory(paths["dual-brain"].parent)
+        for name in ("dual-brain", "brain", "cc-slot"):
+            atomic_bytes(paths[name], shim_content(data, name), 0o755, private_parent=False)
+        atomic_json(
+            paths["active"],
+            {"managedBy": OWNER, "transactionId": transaction_id, "runtime": str(runtime)},
+        )
+        atomic_symlink(paths["current"], runtime)
+        atomic_json(
+            transaction / "applied.json",
+            {
+                "status": "applied",
+                "runtime": str(runtime),
+                "after": {name: file_fingerprint(path) for name, path in paths.items()},
+                "atNs": time.time_ns(),
+            },
+        )
+
+        result = verify_installation(run_tests=True)
+        if not result["ok"]:
+            raise InstallerError("verify 실패: " + "; ".join(result["errors"]))
+    except Exception:
+        restore_before(transaction)
+        raise
+
+    print(json.dumps({"transactionId": transaction_id, "runtime": str(runtime), "verified": True}))
+    return 0
+
+
+def command_apply(args: argparse.Namespace) -> int:
+    with mutation_lock(plugin_data()):
+        return _command_apply_unlocked(args)
+
+
+def verify_installation(*, run_tests: bool) -> dict[str, Any]:
+    errors: list[str] = []
+    data = plugin_data()
+    paths = target_paths(data)
+    current = paths["current"]
+    try:
+        if not current.is_symlink():
+            raise InstallerError("current symlink가 없습니다")
+        runtime = current.resolve(strict=True)
+        if runtime.parent != (data / "runtimes").resolve():
+            raise InstallerError("current target이 runtimes 밖입니다")
+        if not config_is_managed(paths["config"]):
+            raise InstallerError("managed config가 없습니다")
+        if not active_transaction_is_managed(paths["active"]):
+            raise InstallerError("active transaction 기록이 없습니다")
+        active = read_json(paths["active"])
+        if Path(active.get("runtime", "")).resolve() != runtime:
+            raise InstallerError("active transaction runtime이 current와 다릅니다")
+        active_transaction = data / "transactions" / active["transactionId"]
+        if not (active_transaction / "applied.json").is_file():
+            raise InstallerError("active transaction evidence가 없습니다")
+        for name in ("dual-brain", "brain", "cc-slot"):
+            if not managed_shim(paths[name], shim_content(data, name)) or not os.access(paths[name], os.X_OK):
+                raise InstallerError(f"managed shim이 올바르지 않습니다: {paths[name]}")
+        validation = subprocess.run(
+            [read_json(paths["config"])["nativeBinary"], "plugin", "validate", str(runtime), "--strict"],
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        if validation.returncode != 0:
+            errors.append("plugin strict validation 실패")
+        if run_tests:
+            tests = (
+                [sys.executable, str(runtime / "tests" / "test_claude_brain.py")],
+                [sys.executable, str(runtime / "tests" / "test_slot_record.py")],
+                ["node", str(runtime / "tests" / "test_actor.js")],
+                [sys.executable, str(runtime / "tests" / "test_independent_review.py")],
+                [sys.executable, str(runtime / "tests" / "test_paseo_adapter.py")],
+            )
+            for command in tests:
+                result = subprocess.run(
+                    command,
+                    text=True,
+                    capture_output=True,
+                    timeout=120,
+                    check=False,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                )
+                if result.returncode != 0:
+                    errors.append(f"test 실패: {Path(command[-1]).name}")
+    except (InstallerError, OSError, KeyError, subprocess.TimeoutExpired) as error:
+        errors.append(str(error))
+    return {"ok": not errors, "errors": errors}
+
+
+def command_verify(_args: argparse.Namespace) -> int:
+    result = verify_installation(run_tests=True)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["ok"] else 1
+
+
+def command_doctor(_args: argparse.Namespace) -> int:
+    preflight = preflight_payload()
+    installed = verify_installation(run_tests=False)
+    result = {"preflight": preflight, "installation": installed}
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if preflight["supported"] and installed["ok"] else 1
+
+
+def _command_rollback_unlocked(args: argparse.Namespace) -> int:
+    try:
+        uuid.UUID(args.transaction_id)
+    except ValueError as error:
+        raise InstallerError("transaction ID가 UUID가 아닙니다") from error
+    data = plugin_data()
+    transaction = data / "transactions" / args.transaction_id
+    if not transaction.is_dir():
+        raise InstallerError("transaction을 찾을 수 없습니다")
+    active_path = target_paths(data)["active"]
+    if not active_transaction_is_managed(active_path):
+        raise InstallerError("active transaction을 확인할 수 없습니다")
+    if read_json(active_path).get("transactionId") != args.transaction_id:
+        raise InstallerError("현재 active transaction이 아니므로 rollback을 거부합니다")
+    if (transaction / "rollback.json").exists():
+        raise InstallerError("이미 rollback된 transaction입니다")
+    restore_before(transaction)
+    print(json.dumps({"transactionId": args.transaction_id, "rolledBack": True}))
+    return 0
+
+
+def command_rollback(args: argparse.Namespace) -> int:
+    with mutation_lock(plugin_data()):
+        return _command_rollback_unlocked(args)
+
+
+def command_preflight(_args: argparse.Namespace) -> int:
+    result = preflight_payload()
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["supported"] else 1
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="dual-brain")
+    subcommands = root.add_subparsers(dest="command", required=True)
+    preflight = subcommands.add_parser("preflight")
+    preflight.set_defaults(handler=command_preflight)
+    plan = subcommands.add_parser("plan")
+    plan.add_argument("--review-gate", action="store_true")
+    plan.add_argument("--paseo")
+    plan.set_defaults(handler=command_plan)
+    apply = subcommands.add_parser("apply")
+    apply.add_argument("--plan", required=True)
+    apply.set_defaults(handler=command_apply)
+    doctor = subcommands.add_parser("doctor")
+    doctor.set_defaults(handler=command_doctor)
+    verify = subcommands.add_parser("verify")
+    verify.set_defaults(handler=command_verify)
+    rollback = subcommands.add_parser("rollback")
+    rollback.add_argument("transaction_id")
+    rollback.set_defaults(handler=command_rollback)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return int(args.handler(args))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except InstallerError as error:
+        print(f"dual-brain: {error}", file=sys.stderr)
+        raise SystemExit(2)

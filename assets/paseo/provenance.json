@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "integrationStatus": "blocked-without-maintenance-lease",
+  "upstream": "https://github.com/getpaseo/paseo.git",
+  "version": "0.4.0",
+  "tag": "v0.4.0",
+  "tagObject": "020e297038326d86b1afff0986afc371dd26020d",
+  "peeledCommit": "b44bb63cf4ce089ab5750b9fc621ed52827b2820",
+  "packageLockSha256": "8111744a555202ea30fd8dccb3ed8fad0bc96da9c0a9a36748bf6928aaf679ac",
+  "patchSha256": "98e9af25cee4ef88c9e7a1284587b1ae0362800fa05b1a120afa9dc4a1fdedbb",
+  "commitCount": 7,
+  "commits": [
+    "c6b37b2aaa30a5c3915836369461a29c5910a531",
+    "7a75fa85c5ae6950054917b14b7c7088cc59958c",
+    "f170e1eccd295d6dbe1707c70178bbfd9db393f5",
+    "c919a31ef94de3403ea5d568ab4e3f28f4eea6dd",
+    "d261df1d52c68680e1555fb8462f6883b595891a",
+    "629cb9e35b53a29283e93e9336b7d822a222e087",
+    "980d3ca52b63024ce58668012dd9bba794c7dbdb"
+  ],
+  "requiredMaintenanceLease": {
+    "mustBlockNewAgents": true,
+    "mustBlockNewTerminals": true,
+    "mustReportActiveAgents": true,
+    "mustReportPendingAgents": true,
+    "mustReportActiveTerminals": true,
+    "mustRemainHeldThroughRollback": true
+  },
+  "patchBundled": false,
+  "patchNote": "Patch content is not redistributed. Verify the curated commit chain against the upstream repository and compare the SHA-256 below."
+}

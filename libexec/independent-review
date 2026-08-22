@@ -1,0 +1,343 @@
+#!/usr/bin/env node
+"use strict";
+
+const { spawnSync } = require("node:child_process");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const PLUGIN_ROOT = path.resolve(__dirname, "..");
+const ACTOR_LIB =
+  process.env.INDEPENDENT_REVIEW_ACTOR_LIB || path.join(PLUGIN_ROOT, "hooks", "lib", "actor.js");
+const ADAPTERS = {
+  A:
+    process.env.INDEPENDENT_REVIEW_CLAUDE_ADAPTER ||
+    path.join(PLUGIN_ROOT, "libexec", "reviewers", "claude.sh"),
+  O:
+    process.env.INDEPENDENT_REVIEW_CODEX_ADAPTER ||
+    path.join(PLUGIN_ROOT, "libexec", "reviewers", "codex.sh"),
+};
+const ATTESTATION_TTL_MS = 5 * 60 * 1000;
+const MAX_PLAN_BYTES = 512 * 1024;
+const MAX_ADAPTER_BUFFER = 4 * 1024 * 1024;
+
+function defaultAttestation() {
+  const pluginData = process.env.CLAUDE_PLUGIN_DATA;
+  if (!pluginData) fail("CLAUDE_PLUGIN_DATA가 필요합니다");
+  return path.join(pluginData, "attestations", "pending.json");
+}
+
+function usage() {
+  process.stdout.write(`사용법: independent-review --plan-file <path> [--cwd <path>] [--transcript <path>]\n
+현재 actor와 반대 pool을 먼저 호출하고, 그 pool이 명확히 unavailable일 때만
+현재 pool의 새 process·새 context로 fallback합니다.\n`);
+}
+
+function fail(message, code = 2) {
+  process.stderr.write(`independent-review: ${message}\n`);
+  process.exit(code);
+}
+
+function parseArgs(argv) {
+  const options = {
+    planFile: "",
+    cwd: process.cwd(),
+    transcriptPath: "",
+    timeoutSec: 180,
+    attestationPath: process.env.INDEPENDENT_REVIEW_ATTESTATION || defaultAttestation(),
+  };
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === "--help" || arg === "-h") {
+      usage();
+      process.exit(0);
+    }
+    const value = argv[index + 1];
+    if (!value) fail(`${arg} 값이 없습니다`);
+    if (arg === "--plan-file") options.planFile = value;
+    else if (arg === "--cwd") options.cwd = value;
+    else if (arg === "--transcript") options.transcriptPath = value;
+    else if (arg === "--timeout-sec") options.timeoutSec = Number(value);
+    else if (arg === "--attestation") options.attestationPath = value;
+    else fail(`알 수 없는 옵션: ${arg}`);
+    index += 1;
+  }
+  if (!options.planFile) fail("--plan-file이 필요합니다");
+  if (!Number.isInteger(options.timeoutSec) || options.timeoutSec < 1 || options.timeoutSec > 900) {
+    fail("--timeout-sec는 1~900 사이 정수여야 합니다");
+  }
+  return options;
+}
+
+function canonicalPlan(text) {
+  return text.replaceAll("\r\n", "\n").replace(/\n+$/u, "");
+}
+
+function planHash(text) {
+  return crypto.createHash("sha256").update(canonicalPlan(text), "utf8").digest("hex");
+}
+
+function sanitizeForReviewer(text) {
+  return text
+    .replace(/https?:\/\/[^\s<>"'`)\]]+/giu, "[url]")
+    .replace(
+      /(^|[\s("'`])(?:~\/|\/(?!\/)[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._~:@%+,-]+)+)/gmu,
+      (_match, prefix) => `${prefix}[local-path]`,
+    )
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/giu, "[email]")
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/gu, "[local-endpoint]")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/giu, "[identifier]")
+    .replace(/\b\d{12,}\b/gu, "[identifier]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]{8,}\b/giu, "Bearer [redacted]")
+    .replace(/\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}\b/giu, "[secret]")
+    .replace(
+      /\b((?:api[_-]?key|token|secret|password)\s*[:=]\s*)[^\s<>"'`]+/giu,
+      "$1[redacted]",
+    );
+}
+
+function actorFamily(model) {
+  if (/^(gpt-|gpt-proxy)/iu.test(model)) return "O";
+  if (/^claude-/iu.test(model)) return "A";
+  return "";
+}
+
+function alternateClaudeModel(actorModel) {
+  return /sonnet/iu.test(actorModel) ? "opus" : "sonnet";
+}
+
+function childEnvironment(family, reviewMode, actorModel) {
+  const env = { ...process.env };
+  for (const key of [
+    "DUAL_BRAIN_ACTOR_MODEL",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    "CLAUDEX_CONTEXT_TOKENS",
+    "CLAUDEX_MODEL",
+    "CLAUDEX_EFFORT",
+    "INDEPENDENT_REVIEW_ACTOR_LIB",
+    "INDEPENDENT_REVIEW_CLAUDE_ADAPTER",
+    "INDEPENDENT_REVIEW_CODEX_ADAPTER",
+    "INDEPENDENT_REVIEW_ATTESTATION",
+    "CLAUDE_REVIEW_MODEL",
+    "CODEX_REVIEW_TIER",
+    "CODEX_SKIP_BRIEFING",
+  ]) {
+    delete env[key];
+  }
+
+  if (family === "A") {
+    env.CLAUDE_REVIEW_MODEL = reviewMode === "fresh-context" ? alternateClaudeModel(actorModel) : "opus";
+  } else if (family === "O") {
+    env.CODEX_SKIP_BRIEFING = "1";
+    if (reviewMode === "fresh-context") {
+      env.CODEX_REVIEW_TIER = /(?:terra|luna)/iu.test(actorModel) ? "" : "mid";
+    }
+  }
+  return env;
+}
+
+function parseAdapterPayload(stdout) {
+  try {
+    const payload = JSON.parse(stdout.trim());
+    if (!payload || typeof payload !== "object") return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function unavailableReason(result, payload) {
+  if (result.error?.code === "ETIMEDOUT" || payload?.timed_out === true || result.status === 124) {
+    return "timeout";
+  }
+  const combined = [result.stderr, payload?.stderr, payload?.stdout, payload?.warning]
+    .filter((value) => typeof value === "string")
+    .join("\n");
+  if (/rate[ -]?limit|weekly limit|usage limit|quota|out of credits|all credentials.*(?:cooling down|unavailable|exhausted)/iu.test(combined)) {
+    return "quota";
+  }
+  if (/temporarily unavailable|service unavailable|no healthy (?:account|credential)|provider unavailable/iu.test(combined)) {
+    return "unavailable";
+  }
+  return "";
+}
+
+function isSessionId(value) {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value);
+}
+
+function invokeReviewer({ family, mode, actorModel, plan, cwd, timeoutSec, requestId }) {
+  const adapter = ADAPTERS[family];
+  const input = {
+    request_id: requestId,
+    session_id: crypto.randomUUID(),
+    system_prompt:
+      "읽기 전용 독립 검수자다. 구현자의 결론을 신뢰하지 말고 기술적 결함, 빠진 위험, 더 단순한 대안을 찾는다. 명세 자체의 가정도 검증한다. 파일을 수정하지 않는다.",
+    user_message: sanitizeForReviewer(plan),
+    timeout_sec: timeoutSec,
+    cwd,
+    max_chars: 12000,
+  };
+  const result = spawnSync(adapter, {
+    input: `${JSON.stringify(input)}\n`,
+    encoding: "utf8",
+    timeout: (timeoutSec + 10) * 1000,
+    maxBuffer: MAX_ADAPTER_BUFFER,
+    env: childEnvironment(family, mode, actorModel),
+  });
+  const payload = parseAdapterPayload(result.stdout || "");
+  if (payload) {
+    for (const field of ["stdout", "stderr", "warning"]) {
+      if (typeof payload[field] === "string") payload[field] = sanitizeForReviewer(payload[field]);
+    }
+  }
+  result.stderr = sanitizeForReviewer(result.stderr || "");
+  const succeeded =
+    result.status === 0 &&
+    payload?.exit_code === 0 &&
+    typeof payload.model === "string" &&
+    payload.model.trim().length > 0 &&
+    ["requested", "runtime"].includes(payload.model_source) &&
+    (family !== "O" || payload.model_source === "runtime") &&
+    typeof payload.stdout === "string" &&
+    payload.stdout.trim().length > 0 &&
+    isSessionId(payload.session_id) &&
+    payload.read_only === true &&
+    payload.resumed === false;
+  // 성공한 검수 본문·Codex transcript에 등장한 quota 문구는 장애 증거가 아니다.
+  const unavailable = succeeded ? "" : unavailableReason(result, payload);
+  return { family, mode, requestId, result, payload, unavailable, succeeded };
+}
+
+function atomicAttestation(file, attestation) {
+  const directory = path.dirname(file);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const directoryStat = fs.lstatSync(directory);
+  if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || directoryStat.uid !== process.getuid()) {
+    throw new Error("안전하지 않은 attestation directory");
+  }
+  fs.chmodSync(directory, 0o700);
+
+  const temporary = path.join(directory, `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}`);
+  const flags = fs.constants.O_WRONLY |
+    fs.constants.O_CREAT |
+    fs.constants.O_EXCL |
+    (fs.constants.O_NOFOLLOW || 0);
+  const descriptor = fs.openSync(temporary, flags, 0o600);
+  try {
+    fs.writeFileSync(descriptor, `${JSON.stringify(attestation)}\n`, "utf8");
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  fs.chmodSync(temporary, 0o600);
+  fs.renameSync(temporary, file);
+  const directoryDescriptor = fs.openSync(directory, fs.constants.O_RDONLY);
+  try {
+    fs.fsyncSync(directoryDescriptor);
+  } finally {
+    fs.closeSync(directoryDescriptor);
+  }
+}
+
+function main() {
+  const options = parseArgs(process.argv.slice(2));
+  const planStat = fs.statSync(options.planFile);
+  if (!planStat.isFile() || planStat.size > MAX_PLAN_BYTES) fail("plan file이 없거나 크기 제한을 넘었습니다");
+  const plan = fs.readFileSync(options.planFile, "utf8");
+  const cwd = fs.realpathSync(options.cwd);
+  if (!fs.statSync(cwd).isDirectory()) fail("--cwd가 directory가 아닙니다");
+
+  // actor 판정 구현은 hook과 같은 SSOT를 쓴다.
+  // eslint-disable-next-line import/no-dynamic-require, global-require
+  const { resolveActorModel } = require(ACTOR_LIB);
+  const actorModel = resolveActorModel({ transcript_path: options.transcriptPath });
+  const actor = actorFamily(actorModel);
+  if (!actor) fail("actor model을 판정할 수 없습니다");
+
+  const primaryFamily = actor === "A" ? "O" : "A";
+  const requestId = `independent-review-${crypto.randomUUID()}`;
+  let review = invokeReviewer({
+    family: primaryFamily,
+    mode: "cross-family",
+    actorModel,
+    plan,
+    cwd,
+    timeoutSec: options.timeoutSec,
+    requestId,
+  });
+  let primaryFailure = null;
+
+  if (!review.succeeded) {
+    if (!review.unavailable) {
+      fail("primary reviewer가 quota/unavailable 이외 오류로 실패했습니다", 3);
+    }
+    primaryFailure = review.unavailable;
+    review = invokeReviewer({
+      family: actor,
+      mode: "fresh-context",
+      actorModel,
+      plan,
+      cwd,
+      timeoutSec: options.timeoutSec,
+      requestId: `${requestId}-fallback`,
+    });
+    if (!review.succeeded) {
+      if (review.unavailable) {
+        fail("primary와 same-pool fresh-context reviewer가 모두 unavailable입니다", 3);
+      }
+      fail("same-pool fresh-context reviewer가 일반 오류로 실패했습니다", 3);
+    }
+  }
+
+  const now = Date.now();
+  const attestation = {
+    version: 1,
+    planSha256: planHash(plan),
+    actorFamily: actor,
+    actorModel,
+    reviewerFamily: review.family,
+    reviewerModel: review.payload.model,
+    reviewerModelSource: review.payload.model_source,
+    reviewMode: review.mode,
+    primaryFailure,
+    freshContext: true,
+    sharedSid: false,
+    sharedTranscript: false,
+    readOnly: true,
+    reviewRunId: review.payload.session_id,
+    reviewRequestId: review.requestId,
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + ATTESTATION_TTL_MS).toISOString(),
+  };
+
+  try {
+    atomicAttestation(options.attestationPath, attestation);
+  } catch {
+    fail("검수 증명 저장에 실패했습니다", 4);
+  }
+
+  process.stdout.write(
+    `${JSON.stringify({
+      actorFamily: actor,
+      reviewerFamily: review.family,
+      reviewerModel: review.payload.model,
+      reviewerModelSource: review.payload.model_source,
+      reviewMode: review.mode,
+      reviewSessionId: review.payload.session_id,
+      primaryFailure,
+      review: review.payload.stdout,
+    })}\n`,
+  );
+}
+
+try {
+  main();
+} catch (error) {
+  fail(error instanceof Error ? error.message : "알 수 없는 오류");
+}

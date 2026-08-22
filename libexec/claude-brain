@@ -1,0 +1,673 @@
+#!/usr/bin/env python3
+"""Portable Linux/WSL2 Claude Code root brain dispatcher and supervisor."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+TARGET_MODELS = {
+    "sol": "gpt-5.6-sol",
+    "opus": "claude-opus-5",
+    "fable": "claude-fable-5",
+    "sonnet": "claude-sonnet-5",
+}
+NATIVE_ALIASES = {"opus", "sonnet", "haiku", "fable", "opusplan"}
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+SLOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+NATIVE_ENV_REMOVALS = {
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT",
+    "CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY",
+    "ENABLE_TOOL_SEARCH",
+    "CLAUDEX_CONTEXT_TOKENS",
+    "CLAUDEX_MODEL",
+    "CLAUDEX_EFFORT",
+}
+BINDING_OPTIONS = {"--resume", "--session-id", "--model"}
+LEAN_PROMPT_PATH = Path(__file__).resolve().parents[1] / "assets" / "cx-lean.md"
+BINARY_CONFIG_KEYS = {
+    "claude": "nativeBinary",
+    "claudex": "proxyBinary",
+    "tmux": "tmuxBinary",
+}
+
+
+class BrainError(RuntimeError):
+    pass
+
+
+def fail(message: str, code: int = 2) -> None:
+    print(f"claude-brain: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def require_supported_platform() -> None:
+    if not sys.platform.startswith("linux") or not Path("/proc/self/stat").is_file():
+        raise BrainError("Linux 또는 WSL2 /proc 환경만 지원합니다")
+
+
+def load_config() -> dict[str, Any]:
+    explicit = os.environ.get("CLAUDE_BRAIN_CONFIG")
+    if explicit:
+        path = Path(explicit)
+    else:
+        plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA")
+        if not plugin_data:
+            return {}
+        path = Path(plugin_data) / "config.json"
+        if not path.exists():
+            return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as error:
+        raise BrainError(f"config를 읽을 수 없습니다: {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise BrainError(f"config object가 아닙니다: {path}")
+    return value
+
+
+def parse_model(args: list[str]) -> str | None:
+    next_is_model = False
+    model: str | None = None
+    for arg in args:
+        if next_is_model:
+            model = arg
+            next_is_model = False
+            continue
+        if arg == "--model":
+            next_is_model = True
+        elif arg.startswith("--model="):
+            model = arg.removeprefix("--model=")
+    if next_is_model:
+        raise BrainError("--model 값이 없습니다")
+    return model
+
+
+def backend_family(model: str | None, initial_backend: str | None) -> str:
+    if model:
+        normalized = model.lower()
+        if normalized.startswith("gpt-"):
+            return "proxy"
+        if normalized.startswith("claude-") or normalized in NATIVE_ALIASES:
+            return "native"
+        raise BrainError(f"지원하지 않는 model ID입니다: {model}")
+    if initial_backend in {"native", "proxy"}:
+        return initial_backend
+    raise BrainError("model ID 또는 --initial-backend가 필요합니다")
+
+
+def executable(name: str, env_key: str) -> str:
+    configured = os.environ.get(env_key)
+    if not configured:
+        configured_value = load_config().get(BINARY_CONFIG_KEYS[name])
+        if configured_value is not None and not isinstance(configured_value, str):
+            raise BrainError(f"config {BINARY_CONFIG_KEYS[name]} 값이 문자열이 아닙니다")
+        configured = configured_value
+    candidate = configured or shutil.which(name)
+    if not candidate:
+        raise BrainError(f"PATH에서 실행 파일을 찾을 수 없습니다: {name}")
+    try:
+        resolved = Path(candidate).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise BrainError(f"실행 파일을 해석할 수 없습니다: {candidate}: {error}") from error
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise BrainError(f"실행 파일이 없습니다: {resolved}")
+    return str(resolved)
+
+
+def load_lean_prompt() -> str:
+    try:
+        prompt = LEAN_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise BrainError(f"CX lean prompt를 읽을 수 없습니다: {LEAN_PROMPT_PATH}: {error}") from error
+    if not prompt:
+        raise BrainError(f"CX lean prompt가 비어 있습니다: {LEAN_PROMPT_PATH}")
+    return prompt
+
+
+def dispatch(initial_backend: str | None, downstream: list[str]) -> None:
+    model = parse_model(downstream)
+    family = backend_family(model, initial_backend)
+    env = os.environ.copy()
+
+    if family == "proxy":
+        binary = executable("claudex", "CLAUDE_BRAIN_PROXY_BIN")
+        child_args = ["--append-system-prompt", load_lean_prompt(), *downstream]
+        env["DUAL_BRAIN_ACTOR_MODEL"] = model or "gpt-proxy"
+    else:
+        binary = executable("claude", "CLAUDE_BRAIN_NATIVE_BIN")
+        child_args = downstream
+        for key in NATIVE_ENV_REMOVALS:
+            env.pop(key, None)
+        env["DUAL_BRAIN_ACTOR_MODEL"] = model or "claude-native"
+
+    os.execvpe(binary, [binary, *child_args], env)
+
+
+def atomic_json_write(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.parent.is_symlink():
+        raise BrainError(f"state directory가 symlink입니다: {path.parent}")
+    os.chmod(path.parent, 0o700)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as error:
+        raise BrainError(f"state JSON을 읽을 수 없습니다: {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise BrainError(f"state JSON object가 아닙니다: {path}")
+    return value
+
+
+def extract_binding(args: list[str]) -> str | None:
+    value: str | None = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {"--resume", "--session-id"}:
+            if index + 1 >= len(args):
+                raise BrainError(f"{arg} 값이 없습니다")
+            value = args[index + 1]
+            index += 2
+            continue
+        if arg.startswith("--resume="):
+            value = arg.removeprefix("--resume=")
+        elif arg.startswith("--session-id="):
+            value = arg.removeprefix("--session-id=")
+        index += 1
+    if value and not UUID_RE.fullmatch(value):
+        raise BrainError(f"SID 형식이 올바르지 않습니다: {value}")
+    return value
+
+
+def strip_binding_options(args: list[str]) -> list[str]:
+    result: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in BINDING_OPTIONS:
+            if index + 1 >= len(args):
+                raise BrainError(f"{arg} 값이 없습니다")
+            index += 2
+            continue
+        if any(arg.startswith(f"{option}=") for option in BINDING_OPTIONS):
+            index += 1
+            continue
+        result.append(arg)
+        index += 1
+    return result
+
+
+def process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def wait_until(predicate: Any, timeout: float, interval: float = 0.05) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
+def terminate_process_group(child: subprocess.Popen[Any], pgid: int) -> None:
+    if process_group_exists(pgid):
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    wait_until(lambda: child.poll() is not None and not process_group_exists(pgid), 2.0)
+    if process_group_exists(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    wait_until(lambda: child.poll() is not None and not process_group_exists(pgid), 2.0)
+    if child.poll() is None:
+        try:
+            child.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        child.wait(timeout=1.0)
+    except subprocess.TimeoutExpired as error:
+        raise BrainError(f"child process group 종료 실패: PGID={pgid}") from error
+    if process_group_exists(pgid):
+        raise BrainError(f"descendant process group이 남았습니다: PGID={pgid}")
+
+
+def set_foreground_pgid(pgid: int) -> None:
+    if not sys.stdin.isatty():
+        return
+    try:
+        os.tcsetpgrp(sys.stdin.fileno(), pgid)
+    except OSError:
+        pass
+
+
+def parent_pid(pid: int) -> int | None:
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+        return int(fields[3])
+    except (FileNotFoundError, OSError, ValueError, IndexError):
+        return None
+
+
+def is_descendant(pid: int, ancestor: int) -> bool:
+    seen: set[int] = set()
+    current = pid
+    while current > 1 and current not in seen:
+        if current == ancestor:
+            return True
+        seen.add(current)
+        parent = parent_pid(current)
+        if parent is None:
+            return False
+        current = parent
+    return False
+
+
+def runtime_root() -> Path:
+    configured = os.environ.get("CLAUDE_BRAIN_RUNTIME_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+    plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA")
+    if plugin_data:
+        return Path(plugin_data).expanduser() / "state" / "runtime"
+    config_path = os.environ.get("CLAUDE_BRAIN_CONFIG")
+    if config_path:
+        return Path(config_path).expanduser().resolve().parent / "state" / "runtime"
+    raise BrainError("CLAUDE_PLUGIN_DATA 또는 CLAUDE_BRAIN_CONFIG가 필요합니다")
+
+
+def validate_state_dir(state_dir: Path) -> None:
+    root = runtime_root()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if root.is_symlink():
+        raise BrainError(f"runtime root가 symlink입니다: {root}")
+    os.chmod(root, 0o700)
+    state_dir.mkdir(mode=0o700, parents=False, exist_ok=True)
+    if state_dir.is_symlink() or state_dir.parent.resolve() != root.resolve():
+        raise BrainError(f"안전하지 않은 state directory입니다: {state_dir}")
+    os.chmod(state_dir, 0o700)
+
+
+def current_slot_sid(slot_map: Path, slot: str) -> tuple[str | None, dict[str, str]]:
+    try:
+        raw = json.loads(slot_map.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as error:
+        raise BrainError(f"slot-map을 읽을 수 없습니다: {error}") from error
+    if not isinstance(raw, dict):
+        raise BrainError("slot-map object가 아닙니다")
+    mapping = {str(key): str(value) for key, value in raw.items() if isinstance(value, str)}
+    return mapping.get(slot), mapping
+
+
+def duplicate_live_slot(mapping: dict[str, str], slot: str, sid: str) -> str | None:
+    if os.environ.get("CLAUDE_BRAIN_SKIP_TMUX_DUPLICATE_CHECK") == "1":
+        return None
+    tmux = executable("tmux", "CLAUDE_BRAIN_TMUX_BIN")
+    for other_slot, other_sid in mapping.items():
+        if other_slot == slot or other_sid != sid:
+            continue
+        result = subprocess.run(
+            [tmux, "has-session", "-t", f"={other_slot}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode == 0:
+            return other_slot
+    return None
+
+
+def validate_request(
+    request: dict[str, Any],
+    *,
+    slot: str,
+    child_pid: int,
+    child_pgid: int,
+    expected_sid: str | None,
+    slot_map: Path,
+    transcript_dir: Path,
+) -> tuple[str, str, str]:
+    nonce = request.get("nonce")
+    target = request.get("target")
+    sid = request.get("sid")
+    controller_pid = request.get("controllerPid")
+    if not isinstance(nonce, str) or len(nonce) < 16:
+        raise BrainError("request nonce가 올바르지 않습니다")
+    if target not in TARGET_MODELS:
+        raise BrainError(f"request target이 올바르지 않습니다: {target}")
+    if request.get("slot") != slot or request.get("supervisorPid") != os.getpid():
+        raise BrainError("request supervisor/slot이 현재 session과 다릅니다")
+    if request.get("childPid") != child_pid or request.get("childPgid") != child_pgid:
+        raise BrainError("request child PID/PGID가 stale입니다")
+    if not isinstance(controller_pid, int) or not is_descendant(controller_pid, child_pid):
+        raise BrainError("request caller가 현재 brain child가 아닙니다")
+    if not isinstance(sid, str) or not UUID_RE.fullmatch(sid):
+        raise BrainError(f"request SID가 올바르지 않습니다: {sid}")
+    if expected_sid and sid != expected_sid:
+        raise BrainError(f"request SID가 expected SID와 다릅니다: {sid} != {expected_sid}")
+    mapped_sid, mapping = current_slot_sid(slot_map, slot)
+    if mapped_sid != sid:
+        raise BrainError(f"slot-map SID가 request와 다릅니다: {mapped_sid} != {sid}")
+    duplicate = duplicate_live_slot(mapping, slot, sid)
+    if duplicate:
+        raise BrainError(f"SID를 다른 live slot이 사용 중입니다: {duplicate}")
+    if not (transcript_dir / f"{sid}.jsonl").is_file():
+        raise BrainError(f"transcript가 없습니다: {sid}")
+    return target, sid, nonce
+
+
+def response_error(path: Path, nonce: str, message: str) -> None:
+    atomic_json_write(path, {"nonce": nonce, "status": "error", "message": message})
+
+
+def write_ack_pending(path: Path, sid: str) -> None:
+    atomic_json_write(path, {"status": "pending", "expectedSid": sid})
+
+
+def ack_succeeded(path: Path, sid: str) -> bool:
+    try:
+        ack = read_json(path)
+    except BrainError:
+        return False
+    return ack.get("status") == "ok" and ack.get("sid") == sid
+
+
+def build_child_args(script: Path, initial_backend: str, downstream: list[str]) -> list[str]:
+    return [str(script), "--initial-backend", initial_backend, "--", *downstream]
+
+
+def supervise(args: argparse.Namespace, downstream: list[str]) -> None:
+    slot: str = args.slot
+    if not SLOT_RE.fullmatch(slot):
+        raise BrainError(f"지원하지 않는 slot입니다: {slot}")
+    transcript_dir = Path(args.transcript_dir)
+    slot_map = Path(args.slot_map)
+    script = Path(__file__).resolve()
+    state_dir = runtime_root() / slot
+    validate_state_dir(state_dir)
+
+    lock_path = state_dir / "supervisor.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        os.close(lock_fd)
+        raise BrainError(f"slot supervisor가 이미 실행 중입니다: {slot}") from error
+
+    status_path = state_dir / "status.json"
+    request_path = state_dir / "request.json"
+    response_path = state_dir / "response.json"
+    ack_path = state_dir / "session-ack.json"
+    switch_requested = False
+    shutting_down = False
+
+    def request_switch(_signum: int, _frame: Any) -> None:
+        nonlocal switch_requested
+        switch_requested = True
+
+    def request_shutdown(_signum: int, _frame: Any) -> None:
+        nonlocal shutting_down
+        shutting_down = True
+
+    signal.signal(signal.SIGUSR1, request_switch)
+    signal.signal(signal.SIGTERM, request_shutdown)
+    signal.signal(signal.SIGHUP, request_shutdown)
+    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    signal.signal(signal.SIGTTIN, signal.SIG_IGN)
+
+    initial_binding = extract_binding(downstream)
+    expected_sid = initial_binding
+    initial_backend: str = args.initial_backend
+    next_backend = initial_backend
+    next_args = list(downstream)
+    supervisor_pgid = os.getpgrp()
+
+    try:
+        while True:
+            child_env = os.environ.copy()
+            child_env.update(
+                {
+                    "CC_SLOT_OVERRIDE": slot,
+                    "CLAUDE_BRAIN_STATE_DIR": str(state_dir),
+                    "CLAUDE_BRAIN_SUPERVISOR_PID": str(os.getpid()),
+                    "CLAUDE_BRAIN_SLOT": slot,
+                    "CLAUDE_BRAIN_SLOT_MAP": str(slot_map),
+                    "CLAUDE_BRAIN_TRANSCRIPT_DIR": str(transcript_dir),
+                }
+            )
+            if expected_sid:
+                child_env["CLAUDE_BRAIN_EXPECTED_SID"] = expected_sid
+                child_env["CLAUDE_BRAIN_ACK_FILE"] = str(ack_path)
+                write_ack_pending(ack_path, expected_sid)
+            else:
+                child_env.pop("CLAUDE_BRAIN_EXPECTED_SID", None)
+                child_env.pop("CLAUDE_BRAIN_ACK_FILE", None)
+
+            child = subprocess.Popen(
+                build_child_args(script, next_backend, next_args),
+                env=child_env,
+                process_group=0,
+            )
+            child_pid = child.pid
+            child_pgid = child.pid
+            set_foreground_pgid(child_pgid)
+            phase = "starting" if expected_sid and os.environ.get("CLAUDE_BRAIN_SKIP_ACK") != "1" else "running"
+            atomic_json_write(
+                status_path,
+                {
+                    "phase": phase,
+                    "slot": slot,
+                    "supervisorPid": os.getpid(),
+                    "childPid": child_pid,
+                    "childPgid": child_pgid,
+                    "expectedSid": expected_sid,
+                    "backend": next_backend,
+                },
+            )
+
+            ack_deadline = time.monotonic() + float(os.environ.get("CLAUDE_BRAIN_ACK_TIMEOUT", "30"))
+            while child.poll() is None and not switch_requested and not shutting_down:
+                if phase == "starting" and expected_sid:
+                    if ack_succeeded(ack_path, expected_sid):
+                        phase = "running"
+                        atomic_json_write(
+                            status_path,
+                            {
+                                "phase": phase,
+                                "slot": slot,
+                                "supervisorPid": os.getpid(),
+                                "childPid": child_pid,
+                                "childPgid": child_pgid,
+                                "expectedSid": expected_sid,
+                                "backend": next_backend,
+                            },
+                        )
+                    elif time.monotonic() >= ack_deadline:
+                        atomic_json_write(
+                            status_path,
+                            {
+                                "phase": "error",
+                                "slot": slot,
+                                "supervisorPid": os.getpid(),
+                                "message": f"SessionStart SID 확인 timeout: {expected_sid}",
+                            },
+                        )
+                        terminate_process_group(child, child_pgid)
+                        raise BrainError(f"SessionStart SID 확인 timeout: {expected_sid}")
+                time.sleep(0.05)
+
+            if shutting_down:
+                terminate_process_group(child, child_pgid)
+                set_foreground_pgid(supervisor_pgid)
+                return
+
+            if not switch_requested:
+                return_code = child.wait()
+                set_foreground_pgid(supervisor_pgid)
+                atomic_json_write(
+                    status_path,
+                    {
+                        "phase": "stopped",
+                        "slot": slot,
+                        "supervisorPid": os.getpid(),
+                        "exitCode": return_code,
+                    },
+                )
+                raise SystemExit(return_code)
+
+            switch_requested = False
+            try:
+                request = read_json(request_path)
+                target, requested_sid, nonce = validate_request(
+                    request,
+                    slot=slot,
+                    child_pid=child_pid,
+                    child_pgid=child_pgid,
+                    expected_sid=expected_sid,
+                    slot_map=slot_map,
+                    transcript_dir=transcript_dir,
+                )
+            except BrainError as error:
+                nonce = "unknown"
+                try:
+                    candidate = read_json(request_path).get("nonce")
+                    if isinstance(candidate, str):
+                        nonce = candidate
+                except BrainError:
+                    pass
+                response_error(response_path, nonce, str(error))
+                continue
+
+            atomic_json_write(
+                status_path,
+                {
+                    "phase": "switching",
+                    "slot": slot,
+                    "supervisorPid": os.getpid(),
+                    "childPid": child_pid,
+                    "childPgid": child_pgid,
+                    "expectedSid": requested_sid,
+                    "target": target,
+                    "nonce": nonce,
+                },
+            )
+            terminate_process_group(child, child_pgid)
+            set_foreground_pgid(supervisor_pgid)
+            expected_sid = requested_sid
+            target_model = TARGET_MODELS[target]
+            next_backend = backend_family(target_model, None)
+            next_args = [
+                "--resume",
+                requested_sid,
+                "--model",
+                target_model,
+                *strip_binding_options(downstream),
+            ]
+            atomic_json_write(request_path, {"nonce": nonce, "status": "consumed"})
+    finally:
+        set_foreground_pgid(supervisor_pgid)
+        os.close(lock_fd)
+
+
+def split_private_args(argv: list[str]) -> tuple[list[str], list[str]]:
+    try:
+        separator = argv.index("--")
+    except ValueError:
+        return argv, []
+    return argv[:separator], argv[separator + 1 :]
+
+
+def main() -> None:
+    require_supported_platform()
+    argv = sys.argv[1:]
+    if argv and argv[0] == "supervise":
+        private, downstream = split_private_args(argv[1:])
+        parser = argparse.ArgumentParser(prog="claude-brain supervise")
+        parser.add_argument("--initial-backend", choices=("native", "proxy"), required=True)
+        parser.add_argument("--slot", required=True)
+        parser.add_argument("--transcript-dir", required=True)
+        parser.add_argument(
+            "--slot-map",
+            default=str(Path.home() / ".config" / "cc-slots" / "slot-map.json"),
+        )
+        parsed = parser.parse_args(private)
+        if not downstream:
+            raise BrainError("downstream Claude args가 필요합니다")
+        supervise(parsed, downstream)
+        return
+
+    private, downstream = split_private_args(argv)
+    parser = argparse.ArgumentParser(prog="claude-brain", add_help=False)
+    parser.add_argument("--initial-backend", choices=("native", "proxy"))
+    parsed, unknown = parser.parse_known_args(private)
+    if unknown:
+        downstream = [*unknown, *downstream]
+    if not downstream:
+        raise BrainError("downstream Claude args가 필요합니다")
+    dispatch(parsed.initial_backend, downstream)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrainError as error:
+        fail(str(error))

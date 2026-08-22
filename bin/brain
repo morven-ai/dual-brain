@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Request an in-place root brain switch from a managed tmux slot."""
+
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import signal
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+TARGET_MODELS = {
+    "sol": "gpt-5.6-sol",
+    "opus": "claude-opus-5",
+    "fable": "claude-fable-5",
+    "sonnet": "claude-sonnet-5",
+}
+
+
+class BrainRequestError(RuntimeError):
+    pass
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as error:
+        raise BrainRequestError(f"state를 읽을 수 없습니다: {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise BrainRequestError(f"state object가 아닙니다: {path}")
+    return value
+
+
+def atomic_json_write(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def require_pid(value: Any, field: str) -> int:
+    if not isinstance(value, int) or value <= 1:
+        raise BrainRequestError(f"{field}가 올바르지 않습니다: {value}")
+    return value
+
+
+def current_sid(status: dict[str, Any], slot_map: Path, slot: str) -> str:
+    expected = status.get("expectedSid")
+    if isinstance(expected, str) and expected:
+        sid = expected
+    else:
+        mapping = read_json(slot_map)
+        sid = mapping.get(slot)
+    if not isinstance(sid, str):
+        raise BrainRequestError(f"slot-map에 SID가 없습니다: {slot}")
+    try:
+        uuid.UUID(sid)
+    except ValueError as error:
+        raise BrainRequestError(f"SID 형식이 올바르지 않습니다: {sid}") from error
+    return sid
+
+
+def main() -> None:
+    if not sys.platform.startswith("linux") or not Path("/proc/self/stat").is_file():
+        raise BrainRequestError("Linux 또는 WSL2 /proc 환경만 지원합니다")
+    if len(sys.argv) != 2 or sys.argv[1] not in TARGET_MODELS:
+        choices = " | ".join(TARGET_MODELS)
+        raise BrainRequestError(f"사용법: brain {choices}")
+    target = sys.argv[1]
+
+    state_value = os.environ.get("CLAUDE_BRAIN_STATE_DIR")
+    if not state_value:
+        raise BrainRequestError("managed cc/cx slot 안에서만 사용할 수 있습니다")
+    state_dir = Path(state_value)
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise BrainRequestError(f"안전하지 않은 state directory입니다: {state_dir}")
+
+    status_path = state_dir / "status.json"
+    request_path = state_dir / "request.json"
+    response_path = state_dir / "response.json"
+    status = read_json(status_path)
+    if status.get("phase") != "running":
+        raise BrainRequestError(f"현재 slot 상태에서 전환할 수 없습니다: {status.get('phase')}")
+
+    slot = os.environ.get("CLAUDE_BRAIN_SLOT")
+    slot_map_value = os.environ.get("CLAUDE_BRAIN_SLOT_MAP")
+    transcript_dir_value = os.environ.get("CLAUDE_BRAIN_TRANSCRIPT_DIR")
+    if not slot or not slot_map_value or not transcript_dir_value:
+        raise BrainRequestError("supervisor context가 불완전합니다")
+    if status.get("slot") != slot:
+        raise BrainRequestError("status slot과 현재 slot이 다릅니다")
+
+    supervisor_pid = require_pid(status.get("supervisorPid"), "supervisorPid")
+    child_pid = require_pid(status.get("childPid"), "childPid")
+    child_pgid = require_pid(status.get("childPgid"), "childPgid")
+    if not process_exists(supervisor_pid) or not process_exists(child_pid):
+        raise BrainRequestError("supervisor 또는 child가 이미 종료됐습니다")
+
+    sid = current_sid(status, Path(slot_map_value), slot)
+    transcript = Path(transcript_dir_value) / f"{sid}.jsonl"
+    if not transcript.is_file():
+        raise BrainRequestError(f"transcript가 없습니다: {sid}")
+
+    nonce = secrets.token_hex(16)
+    atomic_json_write(
+        request_path,
+        {
+            "nonce": nonce,
+            "target": target,
+            "model": TARGET_MODELS[target],
+            "sid": sid,
+            "slot": slot,
+            "supervisorPid": supervisor_pid,
+            "childPid": child_pid,
+            "childPgid": child_pgid,
+            "controllerPid": os.getpid(),
+            "requestedAtNs": time.time_ns(),
+        },
+    )
+    print(f"brain 전환 요청: {target} · SID {sid}", flush=True)
+    os.kill(supervisor_pid, signal.SIGUSR1)
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if not process_exists(supervisor_pid):
+            raise BrainRequestError("supervisor가 전환 중 종료됐습니다")
+        try:
+            response = read_json(response_path)
+        except BrainRequestError:
+            response = {}
+        if response.get("nonce") == nonce and response.get("status") == "error":
+            raise BrainRequestError(str(response.get("message") or "전환 요청이 거부됐습니다"))
+        time.sleep(0.05)
+
+    raise BrainRequestError("supervisor가 10초 안에 old brain을 종료하지 않았습니다")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrainRequestError as error:
+        print(f"brain: {error}", file=sys.stderr)
+        raise SystemExit(2)
