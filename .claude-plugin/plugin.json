@@ -12,5 +12,6 @@
   "author": {
     "name": "morven-ai"
   },
-  "homepage": "https://github.com/morven-ai/dual-brain"
+  "homepage": "https://github.com/morven-ai/dual-brain",
+  "license": "MIT"
 }
