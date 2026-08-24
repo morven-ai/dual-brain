@@ -1,6 +1,6 @@
 {
   "name": "dual-brain",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Portable Linux/WSL2 same-SID Claude Code dual-brain runtime.",
   "keywords": [
     "claude-code",
