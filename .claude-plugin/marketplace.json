@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "Same-SID Claude Code dual-brain runtime for Linux and WSL2.",
-    "version": "0.1.0"
+    "version": "0.1.1"
   },
   "plugins": [
     {
