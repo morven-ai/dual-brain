@@ -9,6 +9,17 @@
 - 실제 A↔O 왕복: 호스트에 기존 Claude·Codex 구독 인증이 있을 때 별도 opt-in acceptance가 필요하다.
 - Paseo v0.4.0: provenance(tag·commit·lockfile·patch SHA-256)만 고정하고 patch 본문은 재배포하지 않는다. 획득형 maintenance lease가 없어 자동 patch/cutover는 차단된다.
 
+## 개발 호스트의 구현과의 관계
+
+이 plugin은 이식 가능한 재배포본이고, 개발 호스트의 로컬 bash 구현과 **의도적으로 갈라져 있다.** 두 구현을 동기화하지 않는다.
+
+- 로컬 구현: bash. tmux 슬롯과 호스트 고유 경로에 결합돼 있고, Codex 네이티브 슬롯처럼 이 plugin에 없는 기능을 갖는다.
+- 이 plugin: python. preflight·plan·apply·rollback transaction과 config 기반 슬롯 정의를 갖고, 어느 호스트에나 설치된다.
+
+공유하는 것은 코드가 아니라 계약이다 — 슬롯은 얇은 진입점이고, brain 전환은 같은 SID를 유지하며, 검수 게이트는 반대 pool을 강제하고 fail-closed다. 런타임은 각 호스트가 소유한다.
+
+따라서 기본 슬롯 이름(`cc1`~`cc5`, `cx1`~`cx5`)은 이 plugin의 기본값일 뿐이고 로컬 구현과 일치하지 않을 수 있다.
+
 ## 요구 사항
 
 `python3`, `node`, `bash`, `tmux`, `jq`, `flock`, `realpath`, `claude`, `claudex`가 PATH에 있어야 한다. 독립 review gate를 켜려면 `codex-cc`도 필요하다. plugin은 credential을 발급·복사·저장하지 않는다.
